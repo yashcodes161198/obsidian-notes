@@ -77,13 +77,13 @@ A REST API alone doesn't work, because the server has no way to push a new messa
 
 #### Beyond the video: the connection options
 
-| Option | How it works | Good for | Why not here |
-| --- | --- | --- | --- |
-| Polling | Client asks "anything new?" every N seconds | Dashboards, low urgency | Either slow (big N) or wasteful (small N) |
-| Long polling | Server holds the request open until there's data, client re-requests | Occasional pushes | A new HTTP request per message, awkward for chat-rate traffic |
-| SSE | One HTTP response that streams server-to-client events | Live feeds, notifications | One direction only. Sending still needs separate HTTP calls |
-| WebSocket | HTTP request "upgraded" into a full-duplex TCP connection | Chat, games, collaborative editing | Chosen |
-| WebRTC | Peer-to-peer media and data channels | Calls, video | Out of scope, heavy setup (STUN/TURN) |
+| Option       | How it works                                                         | Good for                           | Why not here                                                  |
+| ------------ | -------------------------------------------------------------------- | ---------------------------------- | ------------------------------------------------------------- |
+| Polling      | Client asks "anything new?" every N seconds                          | Dashboards, low urgency            | Either slow (big N) or wasteful (small N)                     |
+| Long polling | Server holds the request open until there's data, client re-requests | Occasional pushes                  | A new HTTP request per message, awkward for chat-rate traffic |
+| SSE          | One HTTP response that streams server-to-client events               | Live feeds, notifications          | One direction only. Sending still needs separate HTTP calls   |
+| WebSocket    | HTTP request "upgraded" into a full-duplex TCP connection            | Chat, games, collaborative editing | Chosen                                                        |
+| WebRTC       | Peer-to-peer media and data channels                                 | Calls, video                       | Out of scope, heavy setup (STUN/TURN)                         |
 
 The cost of WebSockets: the server now holds *state* (open connections). You can't send a user's message to any random server, it has to reach the server holding that user's socket. That fact drives every scaling decision later.
 
