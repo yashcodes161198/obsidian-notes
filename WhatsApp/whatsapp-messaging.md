@@ -682,6 +682,167 @@ Units: mega = 10^6, giga = 10^9, tera = 10^12, peta = 10^15.
 
 **Beyond the video:** mobile connections flap constantly (elevators, tunnels). Treat a disconnect as "offline" only after a short grace period or a missed heartbeat, otherwise presence flickers and generates a storm of events.
 
+## Final data model (multi-device)
+
+The notes use several names for people: user, participant, recipient, client. They are not all separate things. A **user** is a person. A **client** is one logged-in device of that user. A **participant** is a user's membership in a chat. A **recipient** is a role, not a stored entity: every client of every participant except the device that sent the message. With multiple devices, delivery is tracked per client, never per user.
+
+The same tables, without the mapping, are drawn in the "Data model" area of `11 - Final architecture`.
+
+### Terms mapped to entities
+
+| Term used in the notes | What it is | Stored as |
+| --- | --- | --- |
+| User | A person with an account | `users` row |
+| Client / device | One logged-in installation: phone, laptop, web | `clients` row |
+| Participant | A user's membership in one chat | `chat_participants` row |
+| Sender | The user and client that sent a message | Columns on `messages` |
+| Recipient | A client that still has to receive a message | `inbox` row, keyed by client |
+| Chat | A 1:1 or group conversation | `chats` row |
+| Message | One message in a chat | `messages` row |
+| Attachment | A media file in S3 | `attachments` row, referenced by the message |
+
+### Tables
+
+DynamoDB-style keys: PK is the partition key, SK is the sort key.
+
+**`users`**
+
+| Column | Notes |
+| --- | --- |
+| `userId` (PK) | |
+| `phoneNumber` | unique, used to log in |
+| `displayName` | |
+| `createdAt` | |
+
+**`clients`** (devices)
+
+| Column | Notes |
+| --- | --- |
+| `userId` (PK) | owner |
+| `clientId` (SK) | one per logged-in device |
+| `deviceType` | `IOS`, `ANDROID`, `WEB`, `DESKTOP` |
+| `pushToken` | for push notifications when offline, optional |
+| `status` | `ACTIVE` or `LOGGED_OUT` |
+| `lastSeenAt` | |
+| `createdAt` | |
+
+Answers "which devices does Bob have?" with one query.
+
+**`chats`**
+
+| Column | Notes |
+| --- | --- |
+| `chatId` (PK) | |
+| `type` | `DIRECT` or `GROUP` |
+| `name` | null for direct chats |
+| `createdByUserId` | |
+| `createdAt`, `updatedAt` | |
+
+**`chat_participants`**
+
+| Column | Notes |
+| --- | --- |
+| `chatId` (PK) | |
+| `userId` (SK) | |
+| `role` | `ADMIN` or `MEMBER` |
+| `joinedAt` | |
+| GSI: `userId` -> `chatId` | answers "which chats am I in?" |
+
+Membership points to the **user**, not the device. Joining a group makes it visible on all of that user's devices.
+
+**`messages`**
+
+| Column | Notes |
+| --- | --- |
+| `chatId` (PK) | |
+| `messageId` (SK) | time-sortable ID such as a ULID, so a chat's history reads in order |
+| `senderUserId` | |
+| `senderClientId` | which device sent it, so that device is skipped on delivery |
+| `clientMessageId` | ID the phone generates, used to drop duplicates when a send is retried |
+| `content` | text, up to 1 KB |
+| `attachmentIds` | list, optional |
+| `createdAt` | set by the server |
+| `expiresAt` | DynamoDB TTL, 30 days |
+
+The video keyed this table by `messageId` alone. Keying by `chatId` + `messageId` also supports loading a chat's history.
+
+**`inbox`** (undelivered messages, per device)
+
+| Column | Notes |
+| --- | --- |
+| `recipientClientId` (PK) | the device, not the user |
+| `messageId` (SK) | |
+| `chatId` | needed to fetch the message, since `messages` is keyed by `chatId` + `messageId` |
+| `createdAt` | |
+| `expiresAt` | TTL, 30 days |
+
+One row per recipient device. It's deleted when that device acks.
+
+**`attachments`**
+
+| Column | Notes |
+| --- | --- |
+| `attachmentId` (PK) | |
+| `uploaderUserId` | |
+| `s3Key` | object location in S3 |
+| `mimeType`, `sizeBytes` | size capped at 100 MB |
+| `createdAt` | |
+| `expiresAt` | 30 days, matching the S3 lifecycle rule |
+
+The video put the S3 URL straight in the message. A separate table makes size limits, expiry and access checks enforceable.
+
+**`presence`** (optional extension)
+
+| Column | Notes |
+| --- | --- |
+| `userId` (PK) | |
+| `status` | `ONLINE` if any client is connected |
+| `lastSeenAt` | |
+
+### Relations
+
+```mermaid
+erDiagram
+    users ||--o{ clients : "logs in on"
+    users ||--o{ chat_participants : "is member via"
+    chats ||--o{ chat_participants : "has"
+    chats ||--o{ messages : "contains"
+    users ||--o{ messages : "sends"
+    clients ||--o{ messages : "sent from"
+    messages ||--o{ inbox : "awaits delivery in"
+    clients ||--o{ inbox : "has pending"
+    messages }o--o{ attachments : "references"
+    users ||--o| presence : "has"
+```
+
+- A user has many clients, and many chats through `chat_participants`.
+- A chat has many participants and many messages.
+- A message has one sending user and one sending client, and creates one inbox row per recipient client.
+- An inbox row belongs to one client and one message.
+
+### How the tables work together on send
+
+Alice sends in chat 42 from her phone. Bob has 2 devices and Carol has 1.
+
+1. Read `chat_participants` where `chatId = 42`: Alice, Bob, Carol.
+2. For each participant, read `clients` with status `ACTIVE`: Alice's laptop, Bob's phone and laptop, Carol's phone. Skip Alice's phone, the sending device.
+3. In one transaction, write 1 `messages` row plus 4 `inbox` rows.
+4. Publish to Redis channel `client:{clientId}` for each of those 4 clients.
+5. Each device acks, and its inbox row is deleted.
+
+Alice's laptop gets the message too, which keeps her devices in sync.
+
+### What is not a table
+
+- **Redis channels**, `client:{clientId}`. With multiple devices, channels are per device, not per user.
+- **Each chat server's in-memory socket map**, `clientId` -> WebSocket.
+
+Both are rebuilt as devices connect, so neither needs to be stored.
+
+### The limit multiple devices create
+
+The transaction writes 1 message row plus one inbox row per recipient device, and DynamoDB allows 100 items per transaction. So `(participants x devices per user) - 1` has to stay under about 99. In practice, cap active devices per user (for example 3) and lower the maximum group size to match.
+
 ## Beyond the video: gaps worth knowing
 
 The video's design is intentionally interview-sized. These come up if the interviewer pushes:

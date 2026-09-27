@@ -11,14 +11,12 @@
             "id": "1d5a8739916a4b5c",
             "type": "leaf",
             "state": {
-              "type": "markdown",
+              "type": "excalidraw",
               "state": {
-                "file": "Ticketmaster/ticketmaster-booking.md",
-                "mode": "source",
-                "source": false
+                "file": "Uber/14 - Final architecture.md"
               },
-              "icon": "lucide-file",
-              "title": "ticketmaster-booking"
+              "icon": "excalidraw-icon",
+              "title": "14 - Final architecture"
             }
           }
         ]
@@ -41,7 +39,9 @@
               "type": "file-explorer",
               "state": {
                 "sortOrder": "alphabetical",
-                "autoReveal": false
+                "autoReveal": false,
+                "showSearch": false,
+                "searchQuery": ""
               },
               "icon": "lucide-folder-closed",
               "title": "Files"
@@ -81,7 +81,7 @@
       }
     ],
     "direction": "horizontal",
-    "width": 200
+    "width": 300
   },
   "right": {
     "id": "33f0e1ea92237d75",
@@ -186,34 +186,37 @@
   },
   "active": "1d5a8739916a4b5c",
   "lastOpenFiles": [
-    "Ticketmaster/04 - Expiry v1 timestamp in the read query.md",
-    "WhatsApp/10a - Redis PubSub explained.md",
-    "WhatsApp/10 - Routing option C Redis PubSub.md",
-    "WhatsApp/08 - Routing option A Kafka topic per user.md",
-    "WhatsApp/09 - Routing option B consistent hashing.md",
-    "WhatsApp/07 - Scale out and the routing problem.md",
-    "WhatsApp/05 - Media v3 pre-signed URLs.md",
-    "WhatsApp/04 - Media v2 chat server writes to S3.md",
-    "WhatsApp/03 - Media v1 bytes in DynamoDB.md",
-    "WhatsApp/02 - Send and receive with a socket map.md",
+    "Uber/13 - Driver timeouts durable workflow.md",
+    "Uber/12 - Surges ride request queue by region.md",
+    "Uber/11 - Lock v2 distributed lock with TTL.md",
+    "Uber/10 - Lock v1 status column and cron job.md",
+    "Uber/08 - Adaptive location updates.md",
+    "Uber/07 - Location v3 Redis geohash.md",
+    "Uber/06 - Location v2 PostGIS quadtree and batching.md",
+    "Uber/05 - Location v1 Postgres lat long.md",
+    "Uber/04 - Notify accept and navigate.md",
+    "Uber/03 - Driver location updates.md",
+    "Uber/02 - Request ride and matching service.md",
+    "Uber/01 - Fare estimate.md",
     "WhatsApp/whatsapp-messaging.md",
+    "Uber/uber-ride-matching.md",
+    "Uber/14 - Final architecture.md",
+    "Uber/09 - Matching consistency the double send problem.md",
+    "Uber",
+    "obsidian-notes-combined copy.patch",
     "obsidian-notes-combined.patch",
     "whatsapp-design.patch",
     "whatsapp-whatsapp.patch",
+    "WhatsApp/10a - Redis PubSub explained.md",
     "Ticketmaster/ticketmaster-booking.md",
     "Ticketmaster/12 - Final architecture.md",
+    "WhatsApp/07 - Scale out and the routing problem.md",
+    "WhatsApp/05 - Media v3 pre-signed URLs.md",
+    "WhatsApp/03 - Media v1 bytes in DynamoDB.md",
     "Ticketmaster/08 - Search v3 caching popular queries.md",
     "Ticketmaster/06 - Expiry v3 Redis lock with TTL.md",
+    "Ticketmaster/04 - Expiry v1 timestamp in the read query.md",
     "Ticketmaster/02 - Search v1 SQL LIKE.md",
-    "Ticketmaster/03 - Booking v1 status column and Stripe.md",
-    "Ticketmaster/01 - View events.md",
-    "WhatsApp/11 - Final architecture.md",
-    "Ticketmaster/11 - Scale reads with caching.md",
-    "Ticketmaster/10 - Virtual waiting queue.md",
-    "Ticketmaster/09 - Real-time seat map with SSE.md",
-    "Ticketmaster/07 - Search v2 Elasticsearch and CDC.md",
-    "Ticketmaster/05 - Expiry v2 cron job.md",
-    "Ticketmaster",
-    "WhatsApp/06 - Offline delivery with inbox.md"
+    "Ticketmaster"
   ]
 }
