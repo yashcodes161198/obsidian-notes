@@ -422,6 +422,109 @@ The engine persists every step. A crashed worker's workflow resumes on another w
 
 ![[14 - Final architecture]]
 
+## Final data model (one copy per region)
+
+The notes use several words that sound like tables but aren't: location, fare estimate, ride request, offer, match, lock. Only three things are stored rows in the primary database: **rides**, **drivers** and **riders**. A **fare estimate** is the first state of a ride row, as in the video (the write-up's separate Fare entity also works). A **location** is a member of a Redis geo set. An **offer** is a Redis lock plus a push notification. A **match** is `rides.driverId` being set. A **ride request** is a queue message pointing at a ride. The primary database is DynamoDB, as the video settles on, copied per region.
+
+The same tables, without the mapping, are drawn in the "Data model" area of `14 - Final architecture`.
+
+### Terms mapped to entities
+
+| Term used in the notes | What it is | Stored as |
+| --- | --- | --- |
+| Rider | A person who books rides | `riders` row |
+| Driver | A person who drives, with their car and current status | `drivers` row |
+| Ride / trip | One trip from estimate to drop-off | `rides` row |
+| Fare estimate | Price and ETA shown before booking | `fare`, `eta`, `fareExpiresAt` on the `rides` row, status `FARE_ESTIMATED` |
+| Ride request | "Find me a driver for this ride" | status `REQUESTED` on the ride, plus a queue message holding `rideId` |
+| Location | A driver's latest position | Redis geo set member, not a table |
+| Offer | "Do you want this ride?" sent to one driver | Redis lock `lock:driver:{id}` plus a push notification, not stored |
+| Match | A driver accepted | `rides.driverId` set, status `MATCHED` |
+| Region | The shard a ride, driver and queue belong to | `region` column, and the partition of queues and Redis |
+
+### Tables
+
+DynamoDB. PK is the partition key, GSI a global secondary index.
+
+**`riders`**
+
+| Column | Notes |
+| --- | --- |
+| `riderId` (PK) | |
+| `name`, `phone` | |
+| `paymentMethodToken` | from the payment provider; card details never stored |
+| `pushToken` | APNs or FCM token for "you're matched" |
+| `homeRegion` | |
+| `createdAt` | |
+
+**`drivers`**
+
+| Column | Notes |
+| --- | --- |
+| `driverId` (PK) | |
+| `name`, `phone`, `photoUrl` | |
+| `vehicle`, `plate` | car make, model, colour; licence plate |
+| `status` | `OFFLINE`, `AVAILABLE` or `IN_RIDE`. No `REQUEST_SENT`: offers live in the Redis lock |
+| `currentRideId` | set on accept, cleared at drop-off |
+| `region` | which regional stack and geo set the driver is in |
+| `pushToken` | APNs or FCM token for ride offers |
+| `updatedAt` | |
+
+**`rides`**
+
+| Column | Notes |
+| --- | --- |
+| `rideId` (PK) | also the idempotency key for the request queue message |
+| `riderId` | GSI: `riderId` + `createdAt` for ride history |
+| `driverId` | null until matched. GSI: `driverId` + `createdAt` for driver history |
+| `source`, `destination` | lat/long pairs |
+| `fare`, `eta` | from the maps API and pricing formula; the server reads `fare` from here, never from the client |
+| `fareExpiresAt` | a request after this time is rejected or re-priced |
+| `status` | `FARE_ESTIMATED`, `REQUESTED`, `MATCHED`, `PICKED_UP`, `DROPPED_OFF`, `NO_DRIVERS` |
+| `region` | picks the queue partition |
+| `createdAt`, `updatedAt` | set by the server |
+
+### Relations
+
+```mermaid
+erDiagram
+    riders ||--o{ rides : "books"
+    drivers |o--o{ rides : "drives"
+    drivers |o--o| rides : "current ride"
+```
+
+- A rider has many rides. A ride has one rider.
+- A driver has many past rides and at most one current ride (`drivers.currentRideId`).
+- A ride has no driver until it's matched, then exactly one.
+
+### How the tables work together on a ride
+
+Alice requests a ride in Manhattan. Bob is the nearest free driver, and Carol is second.
+
+1. **Estimate.** The ride service calls the maps API and writes a `rides` row: `FARE_ESTIMATED`, `fare`, `eta`, `fareExpiresAt`, `region = us-east`.
+2. **Request.** Alice confirms. The ride service checks `fareExpiresAt`, sets status `REQUESTED`, and puts `{rideId}` on the `us-east` queue partition.
+3. **Nearby drivers.** A matcher pulls the message and runs `GEOSEARCH` on the region's geo set: Bob, Carol, ...
+4. **Filter.** It batch-reads those `drivers` rows and keeps `status = AVAILABLE`.
+5. **Offer.** `SET lock:driver:bob <matcherId> NX EX 10` succeeds, so it pushes the offer to Bob's `pushToken`. If Bob ignores it, the lock expires and Carol gets the next offer.
+6. **Accept.** Bob accepts. One DynamoDB transaction updates both rows:
+   - `rides`: set `driverId = bob`, status `MATCHED`, condition `attribute_not_exists(driverId) AND status = REQUESTED`
+   - `drivers`: set status `IN_RIDE`, `currentRideId`, condition `status = AVAILABLE`
+
+   If either condition fails, the ride was taken or Bob is busy, and the accept is refused.
+7. The matcher deletes the lock, acks the queue message, and notifies Alice.
+8. `picked_up` and `dropped_off` update `rides.status`. At drop-off, Bob's status returns to `AVAILABLE` and `currentRideId` is cleared.
+
+### What is not a table
+
+- **Driver locations**: Redis geo set per region, driverId -> lat/long, plus a sorted set of last-update times for cleanup. Rebuilt within 5 seconds from driver updates.
+- **Driver locks**: Redis `lock:driver:{driverId}` -> matcher instance ID, 10-second TTL. (The video's alternative, a DynamoDB `driver_lock` table, would need an `expiresAt` column and conditional writes, because DynamoDB TTL deletes lazily.)
+- **Ride request queue**: messages holding `rideId`, partitioned by region.
+- **Matching progress**: which driver was offered and how long is left. In-process in the video, persisted by Temporal or Step Functions in the durable-workflow version.
+
+### The limit this model creates
+
+Everything is sharded by region: the geo set, the queue partition, the ride's `region`. A ride's matching only sees drivers in its own region. A rider standing near a region border needs a scatter-gather search across two geo sets and two driver pools, and a driver who crosses the border must move between geo sets. Riders travel between regions too, so `riders` has to be replicated to every region, while `rides` and live driver state stay regional.
+
 ## Beyond the video: gaps worth knowing
 
 - **Accept must be conditional.** Covered above: `WHERE driver_id IS NULL` on the ride, plus the driver's `in_ride` status in the same transaction. Interviewers love "what if two drivers accept at once?".
@@ -465,6 +568,8 @@ More depth, maybe in different places than Evan chose, drawn from real experienc
 14. If the lock can fail, what actually guarantees one driver per ride?
 15. Why partition the ride request queue by region?
 16. What does a durable workflow buy over the video's in-process loop?
+17. Location, offer, match and fare estimate: which of these are rows in the primary database, and where does each of the others live?
+18. What two conditions make the accept transaction safe, and which tables do they touch?
 
 <details>
 <summary>Answers</summary>
@@ -485,5 +590,7 @@ More depth, maybe in different places than Evan chose, drawn from real experienc
 14. A conditional update on the ride row (`WHERE driver_id IS NULL`) in the accept path, plus setting the driver `in_ride` in the same transaction. The lock only prevents duplicate pop-ups.
 15. Head-of-line blocking: in one FIFO line, a slow rural request delays easy city requests. Region partitions isolate them, and regions map to the rest of the sharding.
 16. The loop's state (which driver, how much time left) is persisted. A crashed worker's workflow resumes where it stopped instead of restarting or being lost.
+17. None of them is its own table. The fare estimate is columns on the `rides` row, and a match is `rides.driverId` being set. Locations are Redis geo set members, and an offer is a Redis lock plus a push notification.
+18. On `rides`, `driverId` must not exist yet and status must be `REQUESTED`. On `drivers`, status must be `AVAILABLE`. Both updates run in one transaction, so a ride can't get two drivers and a driver can't take two rides.
 
 </details>

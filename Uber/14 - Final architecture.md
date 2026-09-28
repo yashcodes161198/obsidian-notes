@@ -85,6 +85,46 @@ one offer per driver: SET NX EX 10
 no dropped rides: queue ack + workflow
 availability: horizontal scale + regions ^gqTmyif6
 
+Data model (one copy per region) ^aAPXVGxU
+
+riders
+- riderId (PK)
+- name
+- phone
+- paymentMethodToken
+- pushToken
+- homeRegion
+- createdAt ^TXQQ8l9O
+
+drivers
+- driverId (PK)
+- name
+- phone
+- photoUrl
+- vehicle
+- plate
+- status
+- currentRideId
+- region
+- pushToken
+- updatedAt ^YsG73qdL
+
+rides
+- rideId (PK)
+- riderId
+- driverId
+- source
+- destination
+- fare
+- eta
+- fareExpiresAt
+- status
+- region
+- createdAt
+- updatedAt
+- GSI: riderId + createdAt
+- GSI: driverId + createdAt ^gGObdnkL
+
 %%
 ## Drawing
 ```compressed-json
@@ -210,8 +250,26 @@ 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
 
-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
+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
 
-tGw/v83vaCUCTOwTUziP+79BMnArYfIiIVAHsEhCyrKqvosn4dIYoke1AAorD84CyQnx0fb3pw/vFhExBXgeATlj4h5/VAE0ePbn7gADhdCsfuHzwPbhPgmJfACQriFxCAA=
+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
 ```
 %%

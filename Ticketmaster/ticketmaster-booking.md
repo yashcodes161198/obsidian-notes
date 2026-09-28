@@ -358,6 +358,140 @@ The write-up adds: read-through caching, database triggers to invalidate, long T
 - Reads are the load. 10 million users on one event page refreshing every 5 seconds is **~2 million reads a second**, on one event. Sharding by `eventId` sends all of that to one shard, so sharding doesn't help a hot event. The cache (static data) and read replicas (ticket status) carry it, and the waiting queue caps how many users reach the page.
 - Writes are small. Even with the queue admitting 5,000 users a second, that's a few thousand single-row updates a second, spread across 50,000 different rows. Contention is per seat, not per table.
 
+## Final data model (multi-seat bookings)
+
+The notes use several words for overlapping things: seat, ticket, reservation, hold, booking, order. They are not all tables. A **ticket** is one seat at one event, created when the event is created. A **seat** is not its own table; it's the `seatLabel` column on a ticket, and the venue's layout lives in `venues.seatMap`. A **reservation** or **hold** is a Redis lock with a 10-minute TTL, never a database row. A **booking** (the write-up's order) groups the tickets one user buys in one payment. This model follows the write-up and adds `bookings`, because the video's `userId` column on `ticket` can't represent one payment for several seats.
+
+The same tables, without the mapping, are drawn in the "Data model" area of `12 - Final architecture`.
+
+### Terms mapped to entities
+
+| Term used in the notes | What it is | Stored as |
+| --- | --- | --- |
+| Event | A concert or game on a date at a venue | `events` row |
+| Venue | The place, with its seat layout | `venues` row |
+| Seat map | The venue's layout of sections, rows and seats | `venues.seatMap` column |
+| Performer | Artist or team | `performers` row |
+| Ticket | One seat at one event, sold or not | `tickets` row, created with the event |
+| Seat | A position in the layout | `tickets.seatLabel` column, no table |
+| Reservation / hold | A user's 10-minute claim on a seat during checkout | Redis key `ticket:{ticketId}` with TTL, not a table |
+| Booking / order | One purchase of one or more tickets with one payment | `bookings` row |
+| User / buyer | A person with an account | `users` row |
+| Queue position, admitted user | A user's place in a hot event's waiting line | Redis sorted set and set, not tables |
+| Search result | An event as Elasticsearch indexes it | Elasticsearch document, derived from Postgres by CDC |
+
+### Tables
+
+Postgres. PK is the primary key, FK a foreign key.
+
+**`users`**
+
+| Column | Notes |
+| --- | --- |
+| `id` (PK) | |
+| `email` | unique, used to log in |
+| `name` | |
+| `createdAt` | |
+
+**`performers`**
+
+| Column | Notes |
+| --- | --- |
+| `id` (PK) | |
+| `name` | |
+| `type` | `ARTIST` or `TEAM` |
+| `description` | |
+
+**`venues`**
+
+| Column | Notes |
+| --- | --- |
+| `id` (PK) | |
+| `name` | |
+| `location` | geo point, used by search filters |
+| `seatMap` | JSONB layout of sections, rows and seats. Static, so cache it and send it once |
+
+**`events`**
+
+| Column | Notes |
+| --- | --- |
+| `id` (PK) | |
+| `venueId` (FK) | |
+| `performerId` (FK) | |
+| `name`, `description` | |
+| `type` | `CONCERT`, `SPORTS`, ... for search filters |
+| `startsAt` | event date and time |
+| `queueEnabled` | admin flag for hot events. When true, users go through the virtual waiting queue first |
+| `createdAt`, `updatedAt` | `updatedAt` feeds CDC into Elasticsearch |
+
+**`tickets`**
+
+| Column | Notes |
+| --- | --- |
+| `id` (PK) | |
+| `eventId` (FK) | index on `(eventId, status)` for "available seats for this event" |
+| `seatLabel` | e.g. `SEC 112 / ROW F / 14`. Unique per event: `UNIQUE (eventId, seatLabel)` |
+| `price` | in cents |
+| `status` | `AVAILABLE` or `BOOKED`. No `RESERVED`: holds live in Redis |
+| `bookingId` (FK) | null until booked |
+| `updatedAt` | |
+
+Created in a batch job when the event is created: one row per seat, around 70,000 for a stadium. The video put `userId` here; with bookings, the buyer is `bookings.userId`.
+
+**`bookings`**
+
+| Column | Notes |
+| --- | --- |
+| `id` (PK) | |
+| `userId` (FK) | taken from the JWT, never the request body |
+| `eventId` (FK) | |
+| `status` | `PENDING`, `CONFIRMED`, `FAILED` or `REFUNDED` |
+| `totalAmount` | in cents, computed on the server from ticket prices |
+| `stripePaymentIntentId` | links the Stripe webhook back to this booking |
+| `idempotencyKey` | unique. The client sends it on confirm, and it's also passed to Stripe, so a retried confirm never charges twice |
+| `createdAt`, `updatedAt` | |
+
+### Relations
+
+```mermaid
+erDiagram
+    venues ||--o{ events : "hosts"
+    performers ||--o{ events : "performs at"
+    events ||--o{ tickets : "has one per seat"
+    users ||--o{ bookings : "makes"
+    events ||--o{ bookings : "sold through"
+    bookings ||--o{ tickets : "pays for"
+```
+
+- A venue hosts many events. An event has one venue and one performer.
+- An event has one ticket per seat, all created up front.
+- A user makes many bookings. A booking belongs to one user and one event and pays for one or more tickets.
+- A ticket belongs to at most one booking, and only once it's `BOOKED`.
+
+### How the tables work together on booking
+
+Alice buys seats 14 and 15 in row F for event 42, which is flagged `queueEnabled`.
+
+1. Alice joins the waiting queue (Redis sorted set). When she's admitted, her ID goes into `admitted:42`.
+2. She opens the event page: `events` and `venues` (cached) plus `tickets WHERE eventId = 42 AND status = 'AVAILABLE'`, minus any seats locked in Redis.
+3. She picks two seats. The booking service checks `admitted:42`, then locks both tickets in Redis with `SET ticket:{id} alice NX EX 600`. If either lock fails, it releases the other.
+4. It inserts a `bookings` row with status `PENDING`, the total from the ticket prices, and Alice's `idempotencyKey`.
+5. It creates a Stripe payment with the same idempotency key and stores `stripePaymentIntentId`.
+6. Stripe's webhook arrives. In one transaction: `UPDATE tickets SET status = 'BOOKED', bookingId = :b WHERE id IN (:t14, :t15) AND status = 'AVAILABLE'` must update exactly 2 rows, and the booking becomes `CONFIRMED`. If fewer rows update, roll back, mark the booking `FAILED` and refund.
+7. It deletes the Redis locks and pushes the seat change to open seat maps over SSE.
+
+### What is not a table
+
+- **Seat holds**: Redis `ticket:{ticketId}` -> userId, 10-minute TTL. Expiry is the whole point, and Postgres has no row TTL.
+- **Reserved-seat index**: optional Redis sorted set `event:{id}:reserved` scored by expiry, so the seat map reads one key instead of 50,000.
+- **Waiting queue and admitted set**: Redis `queue:{eventId}` (sorted set) and `admitted:{eventId}` (set with TTL).
+- **Search index**: Elasticsearch documents built from `events`, `venues` and `performers` by CDC. Rebuildable, never the source of truth.
+- **Caches**: event, venue and performer data in Redis, search responses at the CDN.
+
+### The limit this model creates
+
+Every ticket for one event lives under one `eventId`, so a hot event is a hot key range. Sharding by `eventId` puts all of Taylor Swift's writes and ticket reads on one shard, and no amount of sharding spreads a single event. The model survives because the design keeps traffic off those rows: static data comes from cache, availability reads from replicas plus Redis, and the waiting queue admits users no faster than that one shard can book. Multi-seat locks add a second constraint: locking all seats atomically with one Lua script needs the keys on one Redis node, so use a `{eventId}` hash tag.
+
 ## Beyond the video: gaps worth knowing
 
 - **Multi-seat bookings.** Users usually buy 2 to 4 seats together. Acquire locks one by one and release all if any fails, or use a Lua script to lock all seats atomically (needs the keys on one Redis node, for example with a `{eventId}` hash tag). The Booking entity groups them under one payment.
@@ -394,6 +528,8 @@ About 40% breadth, 60% depth, two or three areas in real depth, drawn from exper
 10. Why shouldn't Elasticsearch be the primary store, and what keeps it in sync?
 11. When does caching search results in a CDN stop working?
 12. SSE makes the seat map live. Why doesn't that fix the Taylor Swift on-sale, and what does?
+13. Which of seat, ticket, reservation and booking are tables in the final model, and where does each of the others live?
+14. Why does the final model add a `bookings` table instead of keeping `userId` on `tickets`?
 
 <details>
 <summary>Answers</summary>
@@ -410,5 +546,7 @@ About 40% breadth, 60% depth, two or three areas in real depth, drawn from exper
 10. Weaker durability and no multi-document transactions. Change data capture (or careful dual writes) streams Postgres changes into it.
 11. When queries have too many permutations (raw lat/long, many filters), so keys rarely repeat, or when results become personalized.
 12. The problem is too many users for too few seats, and a fresher map just shows them vanish faster. A virtual waiting queue limits who reaches the seat map and admits batches as seats sell.
+13. Tickets and bookings are tables. A seat is the `seatLabel` column on a ticket, with the layout in `venues.seatMap`. A reservation is a Redis key with a 10-minute TTL.
+14. One purchase often covers several seats with one payment. A booking row holds the buyer, the payment status, the Stripe payment ID and the idempotency key once, and each ticket points to it.
 
 </details>
